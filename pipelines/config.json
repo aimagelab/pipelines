@@ -1,0 +1,6 @@
+{
+    "index_path": "/work/pnrr_fair/webui/evqa_indexes",
+    "kb_jsonl_path": "/work/pnrr_fair/rag_eccv_2024/datasets/evqa/_encyclopedic_kb_wiki.jsonl",
+    "model_name_or_path": "openai/clip-vit-large-patch14-336",
+    "entity_k": 5
+}

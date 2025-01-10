@@ -9,17 +9,48 @@ requirements: ddtrace
 environment_variables: DD_LLMOBS_AGENTLESS_ENABLED, DD_LLMOBS_ENABLED, DD_LLMOBS_APP_NAME, DD_API_KEY, DD_SITE 
 """
 
+import json
 from typing import List, Optional
 import os
-
+import numpy as np
 from utils.pipelines.main import get_last_user_message, get_last_assistant_message
 from pydantic import BaseModel
-from ddtrace.llmobs import LLMObs
 from PIL import Image
 from io import BytesIO
 import base64
 from transformers import AutoModel, AutoImageProcessor
 import torch
+import torch.nn.functional as F
+import faiss
+import pandas as pd
+
+RAG_PROMPT = """Use the following context to answer the user query:\n{context}"""
+
+def get_rag_prompt(context: List[str]):
+    return RAG_PROMPT.format(context='\n\n##\n'.join(context))
+
+def is_debug():
+    return int(os.getenv("DEBUG", 0))
+
+def load_config():
+    with open("pipelines/config.json", "r") as f:
+        return json.load(f)
+
+class Retriever:
+    def __init__(self, dict_info):
+        print("Loading retrieval index")
+        self.index = faiss.read_index(os.path.join(dict_info['index_path'], 'knn.index'))
+        self.values = json.load(open(os.path.join(dict_info['index_path'], 'knn.json'), 'r'))
+        print("Done loading retrieval index")
+
+    def retrieve(self, query, k):
+        if isinstance(query, torch.Tensor):
+            query = query.detach().cpu().numpy()
+        query = query.astype(np.float32)
+        D, indexes = self.index.search(query, k=k)
+        chosen_k = indexes[0, :k].tolist()
+        return [self.values[k][0] for k in chosen_k]
+
 
 class Pipeline:
     class Valves(BaseModel):
@@ -61,16 +92,22 @@ class Pipeline:
         )
 
         # DataDog LLMOBS docs: https://docs.datadoghq.com/tracing/llm_observability/sdk/
-        self.LLMObs = LLMObs()
         self.llm_span = None
         self.chat_generations = {}
+
+        self.config = load_config()
         
-        print('HERE')
         self.device = 'cpu'
         if torch.cuda.is_available():
             self.device = 'cuda'
-        self.image_encoder = AutoModel.from_pretrained('openai/clip-vit-large-patch14-336').to(self.device)
-        self.image_processor = AutoImageProcessor.from_pretrained('openai/clip-vit-large-patch14-336')
+        self.image_encoder = AutoModel.from_pretrained(self.config['model_name_or_path']).to(self.device)
+        self.image_processor = AutoImageProcessor.from_pretrained(self.config['model_name_or_path'])
+
+        self.retriever = Retriever(self.config)
+
+        self.kb = pd.read_json(self.config['kb_jsonl_path'], lines=True, nrows=10000 if is_debug() else None)
+        print(f"Loaded {len(self.kb)} entities from {self.config['kb_jsonl_path']}")
+        self.entity_k = self.config['entity_k']
 
     async def on_startup(self):
         # This function is called when the server is started.
@@ -90,13 +127,14 @@ class Pipeline:
         pass
 
     def set_dd(self):
-        self.LLMObs.enable(
-            ml_app=self.valves.ml_app,
-            api_key=self.valves.dd_api_key,
-            site=self.valves.dd_site,
-            agentless_enabled=True,
-            integrations_enabled=True,
-        )
+        pass
+        # self.LLMObs.enable(
+        #     ml_app=self.valves.ml_app,
+        #     api_key=self.valves.dd_api_key,
+        #     site=self.valves.dd_site,
+        #     agentless_enabled=True,
+        #     integrations_enabled=True,
+        # )
 
     async def inlet(self, body: dict, user: Optional[dict] = None) -> dict:
         print(f"inlet:{__name__}")
@@ -109,20 +147,36 @@ class Pipeline:
         #     ml_app=self.valves.ml_app
         # )
         if isinstance(body['messages'][-1]['content'], list):
+            rag_prompt = ''
             for i, el in enumerate(body['messages'][-1]['content']):
-                if el['type'] == 'text':
-                    body['messages'][-1]['content'][i]['text'] += ' Rispondi in italiano'
-                elif el['type'] == 'image_url':
+                # if el['type'] == 'text':
+                #     body['messages'][-1]['content'][i]['text'] += ' Rispondi in italiano'
+                if el['type'] == 'image_url':
                     img = body['messages'][-1]['content'][1]['image_url']['url']
                     img = Image.open(BytesIO(base64.b64decode(img.split('base64,')[-1])))
-                    ...
+                    img = self.image_processor([img], return_tensors='pt').to(self.device)
+                    with torch.inference_mode():
+                        image_features = self.image_encoder.get_image_features(**img)
+                    image_features = F.normalize(image_features, p=2, dim=-1)
+                    retr_ids = self.retriever.retrieve(image_features, k=self.entity_k)
+                    if is_debug():
+                        retr_ids = self.kb.url.sample(self.entity_k).to_list()
+                    for retr_id in retr_ids[:1]:
+                        entity = self.kb[self.kb.url == retr_id]
+                        if entity.empty:
+                            continue
+                        entity = entity.iloc[0]
+                        context = entity.section_texts
+                        if not isinstance(context, list):
+                            context = [context]
+                        rag_prompt += get_rag_prompt(context)
+            if rag_prompt:
+                for i, el in enumerate(body['messages'][-1]['content']):
+                    if el['type'] == 'text':
+                        body['messages'][-1]['content'][i]['text'] += f"\n{rag_prompt}"
+
         else:
             body['messages'][-1]['content'] += ' Rispondi in italiano'
-        # self.LLMObs.annotate(
-        #     span = self.llm_span,
-        #     input_data = get_last_user_message(body["messages"]),
-        # )
-        
 
         return body
 
